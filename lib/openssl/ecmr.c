@@ -19,6 +19,8 @@
 #include "../hooks.h"
 #include <jose/openssl.h>
 
+#include <openssl/bn.h>
+#include <openssl/ec.h>
 #include <string.h>
 
 declare_cleanup(EC_POINT)
@@ -33,7 +35,7 @@ jwk_prep_handles(jose_cfg_t *cfg, const json_t *jwk)
     if (json_unpack((json_t *) jwk, "{s:s}", "alg", &alg) == -1)
         return false;
 
-    return strcmp(alg, "ECMR") == 0;
+    return str2enum(alg, "ECMR", "ECOPRF", NULL) != SIZE_MAX;
 }
 
 static bool
@@ -47,7 +49,7 @@ jwk_prep_execute(jose_cfg_t *cfg, json_t *jwk)
                     "alg", &alg, "crv", &crv, "kty", &kty) < 0)
         return false;
 
-    if (strcmp(alg, "ECMR") != 0)
+    if (str2enum(alg, "ECMR", "ECOPRF", NULL) == SIZE_MAX)
         return false;
 
     if (kty && strcmp(kty, "EC") != 0)
@@ -119,6 +121,55 @@ alg_exch_exc(const jose_hook_alg_t *alg, jose_cfg_t *cfg,
     return jose_openssl_jwk_from_EC_POINT(cfg, EC_KEY_get0_group(rem), p, NULL);
 }
 
+static json_t *
+alg_exch_exc_oprf(const jose_hook_alg_t *alg, jose_cfg_t *cfg,
+             const json_t *prv, const json_t *pub)
+{
+    openssl_auto(EC_KEY) *lcl = NULL;
+    openssl_auto(EC_KEY) *rem = NULL;
+    openssl_auto(BN_CTX) *bnc = NULL;
+    openssl_auto(EC_POINT) *p = NULL;
+    openssl_auto(BIGNUM) *inv = NULL;
+    const EC_GROUP *grp = NULL;
+
+    bnc = BN_CTX_new();
+    if (!bnc)
+        return NULL;
+
+    lcl = jose_openssl_jwk_to_EC_KEY(cfg, prv);
+    if (!lcl)
+        return NULL;
+
+    rem = jose_openssl_jwk_to_EC_KEY(cfg, pub);
+    if (!rem)
+        return NULL;
+
+    grp = EC_KEY_get0_group(lcl);
+    if (EC_GROUP_cmp(grp, EC_KEY_get0_group(rem), bnc) != 0)
+        return NULL;
+
+    p = EC_POINT_new(grp);
+    if (!p)
+        return NULL;
+
+    if (EC_KEY_get0_private_key(rem)) {
+        if (EC_POINT_mul(grp, p, NULL, EC_KEY_get0_public_key(lcl),
+                         EC_KEY_get0_private_key(rem), bnc) == 0)
+            return NULL;
+    } else if (EC_KEY_get0_private_key(lcl)) {
+            inv = BN_secure_new();
+            if (inv == NULL)
+                return NULL;
+
+            if (BN_mod_inverse(inv, EC_KEY_get0_private_key(lcl), EC_GROUP_get0_order(grp), bnc) == NULL)
+                return NULL;
+            if (EC_POINT_mul(grp, p, NULL, EC_KEY_get0_public_key(rem), inv, bnc) == 0)
+                return NULL;
+    } else return NULL;
+
+    return jose_openssl_jwk_from_EC_POINT(cfg, EC_KEY_get0_group(rem), p, NULL);
+}
+
 static void __attribute__((constructor))
 constructor(void)
 {
@@ -134,6 +185,11 @@ constructor(void)
           .exch.prm = "deriveKey",
           .exch.sug = alg_exch_sug,
           .exch.exc = alg_exch_exc },
+        { .name = "ECOPRF",
+          .kind = JOSE_HOOK_ALG_KIND_EXCH,
+          .exch.prm = "deriveKey",
+          .exch.sug = alg_exch_sug,
+          .exch.exc = alg_exch_exc_oprf },
         {}
     };
 
